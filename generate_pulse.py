@@ -95,4 +95,4 @@ def generate_pulse_data():
         "max_dd": max_dd
     }
 
-    return df_filtered[['execTime', 'equity']], float(total_equity), stats
+    return df_filtered[['execTime', 'equity']], float(total_equity), stats, float(total_unrealized)

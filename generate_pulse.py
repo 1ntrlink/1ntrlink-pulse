@@ -1,93 +1,98 @@
-# generate_pulse.py — FINAL v1 (full history + perfect visuals)
+# generate_pulse.py — Fixed warnings, real climbing curve, Oct 11 start
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)  # Suppress urllib3 SSL warning
+
 import pandas as pd
 from pybit.unified_trading import HTTP
 from datetime import datetime, timedelta
 import pytz
-import json
 import time
-from pathlib import Path
-import numpy as np
 import os
 
 API_KEY = os.environ.get("BYBIT_API_KEY", "bajnYUqpQTd9S4vtrx")
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "5v9JzWRd9ZvZVgUnMU48m9ixr9pC6kicgRET")
 
 def generate_pulse_data():
-    print(f"[{datetime.now(pytz.UTC)}] Pulse data fetch started...")
+    session = HTTP(demo=True, api_key=API_KEY, api_secret=API_SECRET)
 
-    try:
-        session = HTTP(demo=True, api_key=API_KEY, api_secret=API_SECRET, recv_window=10000)
-        bal = session.get_wallet_balance(accountType="UNIFIED")
-        if bal['retCode'] != 0:
-            raise Exception(f"Bybit error: {bal['retMsg']}")
+    # Real total equity from API
+    balance_response = session.get_wallet_balance(accountType='UNIFIED')
+    if balance_response['retCode'] != 0:
+        raise ValueError(f"API failed: {balance_response['retMsg']}")
+    current_balance = float(balance_response['result']['list'][0]['totalEquity'])
 
-        # === FULL HISTORY FROM OCT 10, 2025 ===
-        start_date = datetime(2025, 10, 10, tzinfo=pytz.UTC)
-        end_date = datetime.now(pytz.UTC)
-        days_total = (end_date - start_date).days + 1
+    # UPNL
+    total_unrealized = 0.0
+    positions_response = session.get_positions(category='linear', settleCoin='USDT')
+    if positions_response['retCode'] == 0:
+        positions = positions_response['result']['list']
+        total_unrealized = sum(float(p['unrealisedPnl']) for p in positions if p['unrealisedPnl'])
 
-        all_tx = []
-        cur = start_date
-        while cur < end_date:
-            chunk_end = min(cur + timedelta(days=7), end_date)
-            resp = session.get_transaction_log(
-                accountType="UNIFIED", category="linear", currency="USDT",
-                startTime=int(cur.timestamp()*1000),
-                endTime=int(chunk_end.timestamp()*1000),
-                limit=50
-            )
-            if resp['retCode'] == 0 and resp['result']['list']:
-                all_tx.extend(resp['result']['list'])
-            cur = chunk_end
+    # October 11 start
+    start_date = datetime(2025, 10, 11, tzinfo=pytz.UTC)
+    end_date = datetime.now(pytz.UTC)
 
-        if not all_tx:
-            raise Exception("No transactions found")
+    # Pull transaction log with chunking + cursor
+    all_transactions = []
+    current_start = start_date
+    while current_start < end_date:
+        chunk_end = min(current_start + timedelta(days=7), end_date)
+        chunk_start_ms = int(current_start.timestamp() * 1000)
+        chunk_end_ms = int(chunk_end.timestamp() * 1000)
 
-        df = pd.DataFrame(all_tx)
-        df['execTime'] = pd.to_datetime(df['transactionTime'], unit='ms', utc=True)
-        df['change'] = pd.to_numeric(df['change'], errors='coerce').fillna(0)
-        df = df.sort_values('execTime').reset_index(drop=True)
-        df['equity'] = 100000.0 + df['change'].cumsum()
+        cursor = None
+        while True:
+            params = {
+                'accountType': 'UNIFIED',
+                'category': 'linear',
+                'currency': 'USDT',
+                'startTime': chunk_start_ms,
+                'endTime': chunk_end_ms,
+                'limit': 50
+            }
+            if cursor:
+                params['cursor'] = cursor
 
-        # Fill missing early days with flat 100k line (so chart starts Oct 10)
-        first_tx_time = df['execTime'].iloc[0]
-        if first_tx_time > start_date:
-            filler = pd.date_range(start_date, first_tx_time, freq='6H', inclusive='left')
-            filler_df = pd.DataFrame({'execTime': filler, 'equity': 100000.0})
-            df = pd.concat([filler_df, df], ignore_index=True)
+            response = session.get_transaction_log(**params)
+            if response['retCode'] != 0 or not response['result']['list']:
+                break
 
-        # Unrealized PnL
-        upnl = 0.0
-        pos = session.get_positions(category="linear", settleCoin="USDT")
-        if pos['retCode'] == 0:
-            upnl = sum(float(p.get("unrealisedPnl", 0)) for p in pos["result"]["list"])
+            all_transactions.extend(response['result']['list'])
+            cursor = response['result'].get('nextPageCursor')
+            if not cursor:
+                break
+            time.sleep(0.2)
 
-        total_equity = df['equity'].iloc[-1] + upnl
+        current_start = chunk_end
 
-        # Real max drawdown
-        peak = df['equity'].cummax()
-        drawdown = (df['equity'] - peak) / peak
-        max_dd = drawdown.min() * 100
+    df_filtered = pd.DataFrame(all_transactions)
+    # Fixed to_datetime: cast to int and use 's' unit
+    df_filtered['execTime'] = pd.to_datetime(df_filtered['transactionTime'].astype(int) / 1000, unit='s', utc=True)
+    df_filtered['change'] = pd.to_numeric(df_filtered['change'], errors='coerce')
+    df_filtered = df_filtered.dropna(subset=['change'])
+    df_filtered = df_filtered.sort_values('execTime').reset_index(drop=True)
 
-        stats = {
-            "return_pct": ((total_equity / 100000) - 1) * 100,
-            "days_live": days_total,
-            "max_dd": round(max_dd, 1)
-        }
+    # Flat line from Oct 11 (fixed 'h' freq)
+    fill_end = df_filtered['execTime'].iloc[0]
+    fill_times = pd.date_range(start_date, fill_end, freq='h', inclusive='left')
+    fill_df = pd.DataFrame({'execTime': fill_times, 'change': 0.0})
+    df_filtered = pd.concat([fill_df, df_filtered], ignore_index=True)
+    df_filtered = df_filtered.sort_values('execTime').reset_index(drop=True)
 
-        print(f"PULSE SUCCESS → {len(df)} points | Equity: {total_equity:,.0f} | Return: {stats['return_pct']:+.2f}% | MaxDD: {max_dd:.1f}%")
-        return df[['execTime', 'equity']], float(total_equity), stats
+    df_filtered['equity'] = 100000.0 + df_filtered['change'].cumsum()
 
-    except Exception as e:
-        print(f"Pulse failed ({e}) → using synthetic")
-        now = datetime.now(pytz.UTC)
-        dates = pd.date_range(datetime(2025, 10, 10, tzinfo=pytz.UTC), now, freq='6H')
-        base = 100000
-        trend = np.linspace(0, 290000, len(dates))
-        noise = np.random.normal(0, 6000, len(dates)).cumsum()
-        equity = base + trend + noise
+    total_equity = df_filtered['equity'].iloc[-1] + total_unrealized
 
-        df = pd.DataFrame({'execTime': dates, 'equity': equity})
-        total_equity = equity[-1] + 18420
-        stats = {"return_pct": 308.4, "days_live": 47, "max_dd": -9.2}
-        return df, float(total_equity), stats
+    # Stats
+    peak = df_filtered['equity'].cummax()
+    dd = (df_filtered['equity'] - peak) / peak
+    max_dd = round(dd.min() * 100, 1)
+    days_live = (end_date - start_date).days
+
+    stats = {
+        "return_pct": round(((total_equity / 100000) - 1) * 100, 2),
+        "days_live": days_live,
+        "max_dd": max_dd
+    }
+
+    return df_filtered[['execTime', 'equity']], float(total_equity), stats
